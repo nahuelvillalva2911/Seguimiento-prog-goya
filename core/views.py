@@ -1,34 +1,31 @@
-from rest_framework.exceptions import PermissionDenied
-from .permissions import IsProjectAdminOrReadOnly
-
-from django.http import JsonResponse
-from rest_framework import viewsets
-from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-
-from .models import Project
-from .repositories import TaskRepository
-from .serializers import ProjectSerializer, TaskSerializer
-from .services import TaskService, MembershipService
-
-from django.db import transaction
-from .models import Project, ProjectMembership
+import logging
 
 from django.contrib.auth.models import User
-from rest_framework import generics, permissions
-from .serializers_auth import RegisterSerializer
-
+from django.db import transaction
+from django.http import JsonResponse
+from rest_framework import generics, permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.exceptions import AuthenticationFailed, PermissionDenied
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView
+
+from .models import Project, ProjectMembership, SecurityLog
+from .permissions import IsProjectAdminOrReadOnly
+from .repositories import TaskRepository
+from .serializers import ProjectSerializer, TaskSerializer
+from .serializers_auth import RegisterSerializer
+from .services import MembershipService, TaskService
+from .throttles import LoginRateThrottle
+
+security_logger = logging.getLogger("security")
+
 
 def health_check(request):
     return JsonResponse({"status": "ok", "service": "TaskFlow API"})
 
-
-#class ProjectViewSet(viewsets.ModelViewSet):
-    queryset = Project.objects.all()
-    serializer_class = ProjectSerializer
 
 class ProjectViewSet(viewsets.ModelViewSet):
     queryset = Project.objects.all().order_by("id")
@@ -43,6 +40,32 @@ class ProjectViewSet(viewsets.ModelViewSet):
         with transaction.atomic():
             project = serializer.save()
             ProjectMembership.objects.create(project=project, user=self.request.user, role="admin")
+
+    # Tarea Clase 7: acción para agregar miembros al proyecto
+    @action(detail=True, methods=["post"])
+    def add_member(self, request, pk=None):
+        project = self.get_object()  # has_object_permission verifica que sea admin del proyecto
+        username = request.data.get("username")
+        role = request.data.get("role", "miembro")
+
+        if not username:
+            return Response({"error": "El campo username es obligatorio."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            user = User.objects.get(username=username)
+        except User.DoesNotExist:
+            return Response({"error": "Usuario no encontrado."}, status=status.HTTP_404_NOT_FOUND)
+
+        if ProjectMembership.objects.filter(project=project, user=user).exists():
+            return Response({"error": "El usuario ya es miembro de este proyecto."}, status=status.HTTP_400_BAD_REQUEST)
+
+        membership = ProjectMembership.objects.create(project=project, user=user, role=role)
+        return Response({
+            "message": f"Usuario {user.username} agregado al proyecto con rol {role}.",
+            "project": project.id,
+            "user": user.username,
+            "role": membership.role,
+        }, status=status.HTTP_201_CREATED)
 
 
 class TaskViewSet(viewsets.ModelViewSet):
@@ -85,6 +108,7 @@ class TaskViewSet(viewsets.ModelViewSet):
             return self.get_paginated_response(self.get_serializer(page, many=True).data)
         return Response(self.get_serializer(tasks, many=True).data)
 
+
 class RegisterView(generics.CreateAPIView):
     queryset = User.objects.all()
     serializer_class = RegisterSerializer
@@ -101,3 +125,17 @@ class SocialLoginJWTView(APIView):
     def get(self, request):
         refresh = RefreshToken.for_user(request.user)
         return Response({"refresh": str(refresh), "access": str(refresh.access_token)})
+
+
+class ThrottledTokenObtainPairView(TokenObtainPairView):
+    throttle_classes = [LoginRateThrottle]
+ 
+    def post(self, request, *args, **kwargs):
+        try:
+            return super().post(request, *args, **kwargs)
+        except AuthenticationFailed:
+            ip = request.META.get("REMOTE_ADDR")
+            username = request.data.get("username", "")
+            SecurityLog.objects.create(action="login_failed", detail=f"usuario={username}", ip_address=ip)
+            security_logger.warning(f"Login fallido para usuario {username} desde {ip}")
+            raise
